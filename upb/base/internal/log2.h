@@ -36,6 +36,21 @@ UPB_INLINE int upb_Log2Ceiling(size_t x) {
 #endif
 }
 
+UPB_INLINE int upb_Log2Floor(size_t x) {
+  if (x <= 1) return 0;
+#if SIZE_MAX == ULLONG_MAX && UPB_HAS_BUILTIN(__builtin_clzll)
+  return (sizeof(size_t) * CHAR_BIT) - 1 - __builtin_clzll(x);
+#elif SIZE_MAX == ULONG_MAX && UPB_HAS_BUILTIN(__builtin_clzl)
+  return (sizeof(size_t) * CHAR_BIT) - 1 - __builtin_clzl(x);
+#elif SIZE_MAX == UINT_MAX && UPB_HAS_BUILTIN(__builtin_clz)
+  return (sizeof(size_t) * CHAR_BIT) - 1 - __builtin_clz(x);
+#else
+  int lg2 = 0;
+  while (x >>= 1) lg2++;
+  return lg2;
+#endif
+}
+
 // Returns the smallest power of two that is greater than or equal to x. Returns
 // SIZE_MAX if the computation would overflow.
 UPB_INLINE size_t upb_RoundUpToPowerOfTwo(size_t x) {
