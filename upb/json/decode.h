@@ -22,7 +22,14 @@
 extern "C" {
 #endif
 
-enum { upb_JsonDecode_IgnoreUnknown = 1 };
+enum {
+  upb_JsonDecode_IgnoreUnknown = 1 << 0,
+
+  upb_JsonDecode_ValidateUtf8_Off = 0 << 1,
+  upb_JsonDecode_ValidateUtf8_Warn = 1 << 1,
+  upb_JsonDecode_ValidateUtf8_Enforce = 2 << 1,
+  upb_JsonDecode_ValidateUtf8_Mask = 3 << 1,
+};
 
 enum {
   kUpb_JsonDecodeResult_Ok = 0,
