@@ -102,8 +102,11 @@ selects.config_setting_group(
     ],
 )
 
+# The "@platforms//os:windows" -> incompatible entry was dropped so the Windows
+# binary wheels (cp39 win32/win_amd64, cp310 abi3 win32/win_amd64) can be built
+# on GitHub runners instead of only on Kokoro. The nuget Windows Python header
+# deps selected in py_extension.bzl already support building _message there.
 _message_target_compatible_with = {
-    "@platforms//os:windows": ["@platforms//:incompatible"],
     "@system_python//:none": ["@platforms//:incompatible"],
     "@system_python//:unsupported": ["@platforms//:incompatible"],
     "//conditions:default": [],

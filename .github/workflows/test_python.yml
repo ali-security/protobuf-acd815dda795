@@ -1,124 +1,532 @@
 name: Python Tests
 
 on:
-  workflow_call:
+  workflow_dispatch:
     inputs:
-      continuous-run:
-        required: true
-        description: "Boolean string denoting whether this run is continuous --
-          empty string for presubmit, non-empty string for continuous."
+      test-filter:
+        description: "Optional bazel --test_filter selector. Empty runs the full python suite."
+        required: false
+        default: ""
         type: string
-      safe-checkout:
-        required: true
-        description: "The SHA key for the commit we want to run over"
-        type: string
-      continuous-prefix:
-        required: true
-        description: "The string continuous-only tests should be prefixed with when displaying test
-          results."
-        type: string
-
 
 permissions:
   contents: read
 
+env:
+  BAZELISK_URL_BASE: https://github.com/bazelbuild/bazelisk/releases/download/v1.25.0
+
 jobs:
+  # Linux: the sdist and the pure-python wheel, then the full upstream python
+  # test suite. The matrix mirrors the linux legs of upstream's python test
+  # workflow one-for-one: type [Pure, C++] x version [3.9 .. 3.13], with the
+  # 3.9 legs run against WORKSPACE (--noenable_bzlmod), exactly as upstream's
+  # `- version: "3.9"` include does. //python/... covers
+  # //python:json_format_test.
+  #
+  # Upstream additionally runs a `C++ aarch64` leg (//python/...
+  # //python:aarch64_test --test_tag_filters=-conformance) inside a QEMU
+  # aarch64 emulation container. The fork has no arm64 Linux runner and
+  # //python:aarch64_test asserts the host is aarch64, so that leg cannot be
+  # reproduced here; it is an architecture assertion over the same test
+  # sources the x86_64 C++ legs already run.
   linux:
+    name: Linux ${{ matrix.type }} ${{ matrix.version }} ${{ matrix.nobzlmod && 'No Bzlmod' || '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
     strategy:
-      fail-fast: false   # Don't cancel all jobs if one fails.
+      fail-fast: false
       matrix:
-        type: [ Pure, C++]
+        type: [Pure, C++]
         version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
         include:
           - type: Pure
-            targets: //python/... //python:python_version_test
             flags: --define=use_fast_cpp_protos=false
           - type: C++
-            targets: //python/... //python:python_version_test
             flags: --define=use_fast_cpp_protos=true
-            # Test using WORKSPACE with our oldest support Python version.
+          # Upstream tests the oldest supported Python against WORKSPACE.
           - version: "3.9"
             nobzlmod: true
-            # Our 3.9 image has non-hermetic issues and can't be rebuilt.  Use the old version.
-            image: us-docker.pkg.dev/protobuf-build/containers/test/linux/python:7.6.1-3.9-12e21b8dda91028bc14212a3ab582c7c4d149fac
-          - version: "3.10"
-          - version: "3.11"
-            continuous-only: true
-          - version: "3.12"
-            continuous-only: true
-          - version: "3.13"
-          - type: C++
-            version: aarch64
-            targets: //python/... //python:aarch64_test
-            # TODO Enable this once conformance tests are fixed.
-            flags: --define=use_fast_cpp_protos=true --test_tag_filters=-conformance
-            image: us-docker.pkg.dev/protobuf-build/containers/test/linux/emulation:7.6.1-aarch64-f0d1e209ed9369f69d93ce418990ecff3aa08d6f
-
-    name: ${{ matrix.continuous-only && inputs.continuous-prefix || '' }} Linux ${{ matrix.type }} ${{ matrix.version }} ${{ matrix.nobzlmod && 'No Bzlmod' || '' }}
-    runs-on: ubuntu-latest
     steps:
-      - name: Checkout pending changes
-        if: ${{ !matrix.continuous-only || inputs.continuous-run }}
-        uses: protocolbuffers/protobuf-ci/checkout@v4
-        with:
-          ref: ${{ inputs.safe-checkout }}
-      - name: Run tests
-        if: ${{ !matrix.continuous-only || inputs.continuous-run }}
-        uses: protocolbuffers/protobuf-ci/bazel-docker@v4
-        with:
-          image: ${{ matrix.image || format('us-docker.pkg.dev/protobuf-build/containers/test/linux/python:7.6.1-{0}-e1c2fe666ffa9b941b126541a26340d0ea787cea', matrix.version) }}
-          credentials: ${{ secrets.GAR_SERVICE_ACCOUNT }}
-          bazel-cache: python_linux/${{ matrix.type }}_${{ matrix.version }}
-          bazel: test ${{ matrix.targets }} ${{ matrix.flags }} ${{ matrix.nobzlmod && '--noenable_bzlmod' || '' }} --test_env=KOKORO_PYTHON_VERSION
-
-
-  macos:
-    strategy:
-      fail-fast: false   # Don't cancel all jobs if one fails.
-      matrix:
-        type: [ Pure, C++]
-        version: [ "3.12", "3.13" ]
-        include:
-          - type: Pure
-            targets: //python/... //python:python_version_test
-          - type: C++
-            targets: //python/... //python:python_version_test
-            flags: --define=use_fast_cpp_protos=true
-          - version: "3.13"
-            continuous-only: true
-
-    name: MacOS ${{ matrix.type }} ${{ matrix.version }}
-    runs-on: macos-13
-    steps:
-      - name: Checkout pending changes
-        uses: protocolbuffers/protobuf-ci/checkout@v4
-        with:
-          ref: ${{ inputs.safe-checkout }}
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Pin Python version
-        uses: actions/setup-python@39cd14951b08e74b54015e9e001cdefcf80e669f #v5.1.1
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.version }}
-          cache: pip
-          cache-dependency-path: 'python/requirements.txt'
 
       - name: Validate version
         run: python3 --version | grep ${{ matrix.version }} || (echo "Invalid Python version - $(python3 --version)" && exit 1)
 
-      - name: Create and start virtual environment
+      - name: Install bazelisk
         run: |
-          python3 -m venv venv
-          source venv/bin/activate
+          set -eux
+          curl -fsSL -o "${RUNNER_TEMP}/bazel" "${BAZELISK_URL_BASE}/bazelisk-linux-amd64"
+          chmod +x "${RUNNER_TEMP}/bazel"
+          sudo mv "${RUNNER_TEMP}/bazel" /usr/local/bin/bazel
+          bazel version
+
+      - name: Install sdist build dependencies
+        if: ${{ matrix.type == 'Pure' && matrix.version == '3.12' }}
+        env:
+          PIP_INDEX_URL: https://:2025-12-06@time-machines-pypi.sealsecurity.io/
+        run: python -m pip install --upgrade "setuptools<81" wheel
+
+      - name: Build sdist and pure python wheel
+        if: ${{ matrix.type == 'Pure' && matrix.version == '3.12' }}
+        run: |
+          set -eux
+          bazel build //python/dist:source_wheel //python/dist:pure_python_wheel
+          mkdir -p dist_out
+          cp "$(bazel info bazel-bin)/python/dist/protobuf-6.33.2.tar.gz" dist_out/
+          cp "$(bazel info bazel-bin)/python/dist/protobuf-6.33.2-py3-none-any.whl" dist_out/
+          ls -l dist_out/
+
+      - name: Upload sdist and pure python wheel
+        if: ${{ matrix.type == 'Pure' && matrix.version == '3.12' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: protobuf-python-linux-sdist-and-pure-wheel
+          path: |
+            dist_out/protobuf-6.33.2.tar.gz
+            dist_out/protobuf-6.33.2-py3-none-any.whl
+          if-no-files-found: error
 
       - name: Run tests
-        uses: protocolbuffers/protobuf-ci/bazel@v4
         env:
           KOKORO_PYTHON_VERSION: ${{ matrix.version }}
+          TEST_FILTER: ${{ inputs.test-filter }}
+          BZLMOD_FLAG: ${{ matrix.nobzlmod && '--noenable_bzlmod' || '' }}
+        run: |
+          set -eux
+          if [ -n "${TEST_FILTER}" ]; then
+            bazel test //python/... //python:python_version_test ${{ matrix.flags }} ${BZLMOD_FLAG} --test_env=KOKORO_PYTHON_VERSION --test_filter="${TEST_FILTER}"
+          else
+            bazel test //python/... //python:python_version_test ${{ matrix.flags }} ${BZLMOD_FLAG} --test_env=KOKORO_PYTHON_VERSION
+          fi
+
+  # Linux compiled wheels: the three manylinux2014 binary wheels
+  # (cp39-abi3 x86_64 / aarch64 / s390x).
+  #
+  # Upstream builds these in the private GAR release container
+  # us-docker.pkg.dev/protobuf-build/release-containers/linux/apple (see the
+  # build_wheels job of .github/workflows/test_upb.yml), which a fork cannot
+  # pull. //toolchain:clang_suite is a plain clang cross-compile, so the two
+  # things that container provides are reconstructed here on a stock runner:
+  #
+  #   1. clang/llvm-ar under /usr/local (the absolute tool_paths that
+  #      toolchain/cc_toolchain_config.bzl hardcodes), with the clang resource
+  #      directory at /usr/local/lib/clang so its headers stay inside the
+  #      declared cxx_builtin_include_directories.
+  #   2. the manylinux2014 sysroots under /opt/manylinux/2014/<arch>, filled
+  #      from the PUBLIC quay.io/pypa manylinux2014 images. Nothing
+  #      foreign-arch is executed - `docker export` only streams the image
+  #      filesystem - so no QEMU/binfmt is needed.
+  #
+  # The bazel flags are upstream's build_wheels flags verbatim, plus one
+  # --cpu at a time (upstream builds //python/dist, whose py_dist transition
+  # fans the matrix out internally) and the two //python flags that transition
+  # sets for linux in python/dist/BUILD.bazel's limited_api_wheels.
+  #
+  # One matrix leg per --cpu: each leg runs exactly one bazel wheel build, so
+  # the three cross-compiles run in parallel instead of sequentially. The
+  # clang-staging step is per-runner setup and still runs in every leg; the
+  # sysroot step is parameterised so a leg only populates the one sysroot its
+  # own --cpu needs.
+  linux-manylinux:
+    name: Linux manylinux2014 binary wheel ${{ matrix.cpu }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cpu: linux-x86_64
+            expected_tag: cp39-abi3-manylinux2014_x86_64
+            sysroot_image: quay.io/pypa/manylinux2014_x86_64
+            sysroot_platform: linux/amd64
+            sysroot_dest: /opt/manylinux/2014/x86_64
+          - cpu: linux-aarch_64
+            expected_tag: cp39-abi3-manylinux2014_aarch64
+            sysroot_image: quay.io/pypa/manylinux2014_aarch64
+            sysroot_platform: linux/arm64
+            sysroot_dest: /opt/manylinux/2014/aarch64
+          - cpu: linux-s390_64
+            expected_tag: cp39-abi3-manylinux2014_s390x
+            sysroot_image: quay.io/pypa/manylinux2014_s390x
+            sysroot_platform: linux/s390x
+            sysroot_dest: /opt/manylinux/2014/s390x
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Pin Python version
+        uses: actions/setup-python@v5
         with:
-          version: 7.6.1 # Bazel version
-          credentials: ${{ secrets.GAR_SERVICE_ACCOUNT }}
-          bazel-cache: python_macos/${{ matrix.type }}_${{ matrix.version }}
-          bazel: >-
-            test ${{ matrix.targets }} ${{ matrix.flags }}
-            --test_env=KOKORO_PYTHON_VERSION=${{ matrix.version }}
-            --macos_minimum_os=11.0
+          python-version: "3.12"
+
+      - name: Install bazelisk
+        run: |
+          set -eux
+          curl -fsSL -o "${RUNNER_TEMP}/bazel" "${BAZELISK_URL_BASE}/bazelisk-linux-amd64"
+          chmod +x "${RUNNER_TEMP}/bazel"
+          sudo mv "${RUNNER_TEMP}/bazel" /usr/local/bin/bazel
+          bazel version
+
+      - name: Stage clang at the absolute paths the toolchain config hardcodes
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-18 lld-18 llvm-18
+          # toolchain/cc_toolchain_config.bzl pins tool_paths at
+          #   gcc -> /usr/local/bin/clang
+          #   ar  -> /usr/local/bin/llvm-ar
+          #   ld  -> linker_path, which toolchain/BUILD.bazel sets to /usr/bin/ld
+          # and declares /usr/local/include + /usr/local/lib/clang as builtin
+          # include directories. Copy (not symlink) the LLVM tree into
+          # /usr/local so clang derives its resource dir from /proc/self/exe as
+          # /usr/local/lib/clang/18 and its bundled headers land inside a
+          # declared builtin include directory - a symlink would resolve back
+          # to /usr/lib/llvm-18 and bazel would reject stddef.h as an
+          # undeclared inclusion.
+          sudo cp -a /usr/lib/llvm-18/bin/. /usr/local/bin/
+          sudo rm -rf /usr/local/lib/clang
+          sudo cp -a /usr/lib/llvm-18/lib/clang /usr/local/lib/clang
+          # The three Linux toolchains cross-compile to x86_64, aarch64 and
+          # s390x through one linker at /usr/bin/ld. The host GNU BFD ld only
+          # knows x86-64, so point /usr/bin/ld at ld.lld, which is natively
+          # multi-target and GNU-ld option compatible.
+          sudo ln -sf /usr/lib/llvm-18/bin/ld.lld /usr/bin/ld
+          /usr/local/bin/clang --version
+          /usr/local/bin/clang++ --version
+          /usr/local/bin/llvm-ar --version
+          /usr/bin/ld --version
+          test -f /usr/local/lib/clang/18/include/stddef.h
+
+      - name: Populate the manylinux2014 sysroot from the public pypa image
+        env:
+          SYSROOT_IMAGE: ${{ matrix.sysroot_image }}
+          SYSROOT_PLATFORM: ${{ matrix.sysroot_platform }}
+          SYSROOT_DEST: ${{ matrix.sysroot_dest }}
+        run: |
+          set -euxo pipefail
+          extract_sysroot() {
+            image="$1"
+            platform="$2"
+            dest="$3"
+            sudo mkdir -p "${dest}"
+            docker pull --platform "${platform}" "${image}"
+            cid="$(docker create --platform "${platform}" "${image}")"
+            # `docker export` streams the image filesystem; the container is
+            # never started, so a foreign-arch image needs no emulation.
+            # Device nodes under dev/ are the only entries a non-privileged
+            # extraction cannot recreate, so exclude them by name rather than
+            # swallowing tar's exit status.
+            #
+            # --anchored is load-bearing: GNU tar's --exclude defaults to
+            # --no-anchored, where a pattern matches at ANY path-segment
+            # boundary, so a bare 'sys/*' also matched usr/include/sys/*. That
+            # silently dropped glibc's entire sys/ header directory from all
+            # three sysroots and every compile died on features.h:375 needing
+            # sys/cdefs.h. Anchoring pins the patterns to the archive root.
+            docker export "${cid}" \
+              | sudo tar -x -C "${dest}" --anchored \
+                  --exclude='dev/*' --exclude='proc/*' --exclude='sys/*' \
+                  --warning=no-timestamp
+            docker rm "${cid}"
+            # toolchain/cc_toolchain_config.bzl emits `-isystem <sysroot>` --
+            # the sysroot ROOT, not <sysroot>/usr/include -- because protobuf's
+            # own release container stores the libstdc++ headers FLATTENED
+            # there. The pypa images keep them in the normal distro location
+            # (under a devtoolset prefix, plus possibly a base-system gcc), so
+            # `#include <array>` is looked up as <sysroot>/array and dies with
+            # "'array' file not found" while the C headers, found through
+            # --sysroot, resolve fine. Flatten the C++ header tree onto the
+            # sysroot root so the layout matches what the toolchain expects.
+            # Versions differ per architecture, so everything here is globbed:
+            # prefer the devtoolset tree, and take the highest gcc version.
+            cxx_inc=""
+            # Rooted at "${dest}" (which always exists) rather than at the
+            # devtoolset prefix, so a layout without that prefix makes find
+            # print nothing instead of erroring on a missing path.
+            for candidate in \
+                $(find "${dest}" -maxdepth 8 -mindepth 8 -type d -path '*/opt/rh/*/root/usr/include/c++/*' | sort -Vr) \
+                $(find "${dest}" -maxdepth 4 -mindepth 4 -type d -path '*/usr/include/c++/*' | sort -Vr); do
+              if [ -f "${candidate}/array" ]; then
+                cxx_inc="${candidate}"
+                break
+              fi
+            done
+            if [ -z "${cxx_inc}" ]; then
+              echo "sysroot ${dest}: found no C++ include directory containing <array>" >&2
+              exit 1
+            fi
+            echo "sysroot ${dest}: flattening C++ headers from ${cxx_inc}"
+            sudo cp -a "${cxx_inc}"/. "${dest}"/
+            # The arch-specific half (bits/c++config.h and friends) lives in a
+            # sibling directory named after the target triple, e.g.
+            # x86_64-redhat-linux. Merge its contents into the bits/ directory
+            # just copied rather than replacing it.
+            triple_inc=""
+            for config in "${cxx_inc}"/*/bits/c++config.h; do
+              if [ -f "${config}" ]; then
+                triple_inc="$(dirname "$(dirname "${config}")")"
+                break
+              fi
+            done
+            if [ -z "${triple_inc}" ]; then
+              echo "sysroot ${dest}: found no target-triple directory with bits/c++config.h under ${cxx_inc}" >&2
+              exit 1
+            fi
+            echo "sysroot ${dest}: flattening arch-specific C++ headers from ${triple_inc}"
+            sudo cp -a "${triple_inc}"/. "${dest}"/
+            for header in array cstddef bits/c++config.h; do
+              if [ ! -f "${dest}/${header}" ]; then
+                echo "sysroot ${dest} is missing flattened C++ header ${header}" >&2
+                exit 1
+              fi
+            done
+            # Same class of problem as the headers, but for LIBRARIES.
+            # toolchain/BUILD.bazel links through /usr/bin/ld with
+            # `--sysroot <sysroot>`, so ld only searches the sysroot-prefixed
+            # default dirs: <sysroot>/usr/lib64, /lib64, /usr/lib, /lib. The
+            # gcc startup objects (crtbeginS.o, crtbegin.o, crtend.o,
+            # crtendS.o) and the gcc runtime libs (libgcc.a, libgcc_s.so,
+            # libstdc++.*, libsupc++.a) are not in any of those -- they live in
+            # the gcc-version-specific directory
+            # <sysroot>/opt/rh/devtoolset-*/root/usr/lib/gcc/<triple>/<gccver>.
+            # protobuf's own release-container sysroot has them where ld looks;
+            # the pypa images do not, so `cannot find crtbeginS.o`. Copy them
+            # onto ld's search path. Everything is globbed: gcc version and
+            # target triple differ per architecture.
+            gcc_lib=""
+            # Rooted at "${dest}" for the same reason as the header search
+            # above: find prints nothing instead of erroring when a layout has
+            # no devtoolset prefix. lib* covers arches that keep the gcc
+            # directory under lib64 rather than lib.
+            for candidate in \
+                $(find "${dest}" -maxdepth 9 -mindepth 9 -type d -path '*/opt/rh/*/root/usr/lib*/gcc/*/*' | sort -Vr) \
+                $(find "${dest}" -maxdepth 5 -mindepth 5 -type d -path '*/usr/lib*/gcc/*/*' | sort -Vr); do
+              if [ -f "${candidate}/crtbeginS.o" ]; then
+                gcc_lib="${candidate}"
+                break
+              fi
+            done
+            if [ -z "${gcc_lib}" ]; then
+              echo "sysroot ${dest}: found no gcc lib directory containing crtbeginS.o" >&2
+              exit 1
+            fi
+            echo "sysroot ${dest}: publishing gcc libs from ${gcc_lib}"
+            sudo mkdir -p "${dest}"/usr/lib64 "${dest}"/usr/lib
+            # `-a <dir>/.` merges into the existing directory instead of
+            # replacing it; `-n` keeps any real sysroot library that is already
+            # there winning over the copy.
+            sudo cp -a -n "${gcc_lib}"/. "${dest}"/usr/lib64/
+            sudo cp -a -n "${gcc_lib}"/. "${dest}"/usr/lib/
+            # The devtoolset libstdc++.so* sits one level up, beside the
+            # gcc-version directory rather than inside it, so publish that too.
+            for dts_lib64 in $(find "${dest}" -maxdepth 6 -mindepth 6 -type d -path '*/opt/rh/*/root/usr/lib64' | sort -Vr); do
+              echo "sysroot ${dest}: publishing devtoolset libs from ${dts_lib64}"
+              sudo cp -a -n "${dts_lib64}"/. "${dest}"/usr/lib64/
+            done
+            if [ ! -f "${dest}/usr/lib64/crtbeginS.o" ] && [ ! -f "${dest}/usr/lib/crtbeginS.o" ]; then
+              echo "sysroot ${dest} is missing crtbeginS.o in usr/lib64 and usr/lib" >&2
+              exit 1
+            fi
+            for header in usr/include/stdio.h usr/include/sys/cdefs.h; do
+              if [ ! -f "${dest}/${header}" ]; then
+                echo "sysroot ${dest} is missing ${header}" >&2
+                exit 1
+              fi
+            done
+          }
+          extract_sysroot "${SYSROOT_IMAGE}" "${SYSROOT_PLATFORM}" "${SYSROOT_DEST}"
+          ls -l /opt/manylinux/2014/
+
+      - name: Build manylinux2014 binary wheel
+        env:
+          CPU: ${{ matrix.cpu }}
+          EXPECTED_TAG: ${{ matrix.expected_tag }}
+        run: |
+          set -euxo pipefail
+          # Flags copied verbatim from the build_wheels job of
+          # .github/workflows/test_upb.yml. --//python:limited_api and
+          # --//python:python_version reproduce what py_dist's transition sets
+          # for every linux cpu in limited_api_wheels (python/dist/BUILD.bazel):
+          # they are what makes the wheel tag cp39-abi3 and what makes
+          # py_extension depend on the hermetic @python-3.9.0 headers instead
+          # of the runner's Python 3.12. Without them python_version stays
+          # "system" and the wheel would be tagged cp312.
+          COMMON=(
+            --crosstool_top=//toolchain:clang_suite
+            --//toolchain:release=true
+            -c dbg
+            --incompatible_enable_cc_toolchain_resolution=false
+            --//python:limited_api=true
+            --//python:python_version=39
+          )
+          mkdir -p wheelhouse
+          build_arch() {
+            cpu="$1"
+            expected_tag="$2"
+            # --symlink_prefix=/ (upstream's flag) means no bazel-bin symlink
+            # is created in the workspace, so ask bazel where the output tree
+            # for this exact configuration is.
+            bazel build "${COMMON[@]}" --symlink_prefix=/ --cpu="${cpu}" //python/dist:binary_wheel
+            bindir="$(bazel info "${COMMON[@]}" --cpu="${cpu}" bazel-bin)"
+            found=0
+            for whl in "${bindir}/python/dist/"*.whl; do
+              [ -f "${whl}" ] || continue
+              cp "${whl}" wheelhouse/
+              found=1
+            done
+            if [ "${found}" -ne 1 ]; then
+              echo "no wheel produced for --cpu=${cpu} under ${bindir}/python/dist" >&2
+              exit 1
+            fi
+            if ! ls wheelhouse/ | grep -q "${expected_tag}"; then
+              echo "expected a wheel tagged ${expected_tag} for --cpu=${cpu}" >&2
+              ls -l wheelhouse/ >&2
+              exit 1
+            fi
+          }
+          build_arch "${CPU}" "${EXPECTED_TAG}"
+          ls -l wheelhouse/
+
+      - name: Upload manylinux2014 binary wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: protobuf-python-linux-wheels-${{ matrix.cpu }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  # macOS: the cp39-abi3 macosx_10_9_universal2 binary wheel.
+  macos:
+    name: macOS universal2 binary wheel
+    runs-on: macos-14
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Pin Python version
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Provide llvm-lipo at the path py_dist_module hardcodes
+        run: |
+          set -eux
+          # python/dist/dist.bzl's _py_dist_module_impl runs the multiarch
+          # combine step as ctx.actions.run(executable = "/usr/local/bin/llvm-lipo").
+          brew install llvm
+          sudo mkdir -p /usr/local/bin
+          sudo ln -sf "$(brew --prefix llvm)/bin/llvm-lipo" /usr/local/bin/llvm-lipo
+          /usr/local/bin/llvm-lipo -version
+
+      - name: Install bazelisk
+        run: |
+          set -eux
+          curl -fsSL -o "${RUNNER_TEMP}/bazel" "${BAZELISK_URL_BASE}/bazelisk-darwin-arm64"
+          chmod +x "${RUNNER_TEMP}/bazel"
+          sudo mv "${RUNNER_TEMP}/bazel" /usr/local/bin/bazel
+          bazel version
+
+      - name: Build universal2 binary wheel
+        run: |
+          set -eux
+          # ci/macOS.bazelrc starts with a relative `import common.bazelrc`, which
+          # bazel resolves against the workspace root, not against ci/.
+          cp ci/common.bazelrc ./common.bazelrc
+          bazel --bazelrc=ci/macOS.bazelrc build //python/dist:binary_wheel \
+            --//toolchain:release=true \
+            --cpu=osx-universal2 \
+            --//python:limited_api=true \
+            --//python:python_version=39
+          mkdir -p wheelhouse
+          cp "$(bazel info bazel-bin)/python/dist/"*.whl wheelhouse/
+          ls -l wheelhouse/
+
+      - name: Upload macOS binary wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: protobuf-python-macos-universal2-wheel
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  # Windows: four binary wheels — cp39-cp39 (full API) and cp310-abi3 (limited
+  # API) for each of win32 and win_amd64.
+  #
+  # One matrix leg per wheel, so the four builds run in parallel. The
+  # bazelisk install and the common.bazelrc copy are per-runner setup and
+  # still happen in every leg.
+  windows:
+    name: Windows binary wheel ${{ matrix.cpu }} ${{ matrix.python_version }}
+    runs-on: windows-2022
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cpu: win32
+            limited_api: "false"
+            python_version: "39"
+          - cpu: win64
+            limited_api: "false"
+            python_version: "39"
+          - cpu: win32
+            limited_api: "true"
+            python_version: "310"
+          - cpu: win64
+            limited_api: "true"
+            python_version: "310"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Pin Python version
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install bazelisk
+        run: |
+          set -eux
+          mkdir -p /c/bazelisk
+          curl -fsSL -o /c/bazelisk/bazel.exe "${BAZELISK_URL_BASE}/bazelisk-windows-amd64.exe"
+          echo "C:\\bazelisk" >> "${GITHUB_PATH}"
+
+      - name: Build binary wheel
+        env:
+          CPU: ${{ matrix.cpu }}
+          LIMITED_API: ${{ matrix.limited_api }}
+          PYTHON_VERSION: ${{ matrix.python_version }}
+        run: |
+          set -eux
+          bazel version
+          # ci/Windows.bazelrc starts with a relative `import common.bazelrc`, which
+          # bazel resolves against the workspace root, not against ci/.
+          cp ci/common.bazelrc ./common.bazelrc
+          mkdir -p python_dist_out
+          build_wheel() {
+            bazel --bazelrc=ci/Windows.bazelrc build --config=clang-cl \
+              //python/dist:binary_wheel \
+              --//toolchain:release=true \
+              --cpu="$1" \
+              --//python:limited_api="$2" \
+              --//python:python_version="$3"
+            cp "$(bazel info bazel-bin)/python/dist/"*.whl python_dist_out/
+            ls -l python_dist_out/
+          }
+          build_wheel "${CPU}" "${LIMITED_API}" "${PYTHON_VERSION}"
+          ls -l python_dist_out/
+
+      - name: Upload Windows binary wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: protobuf-python-windows-wheels-${{ matrix.cpu }}-${{ matrix.python_version }}
+          path: python_dist_out/*.whl
+          if-no-files-found: error

@@ -2,11 +2,20 @@
 
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
+# The hdrs glob is anchored at Python-<version>/Include rather than written as
+# "**/Include/**/*.h". The loose pattern relies on the filesystem being
+# case-sensitive to skip Modules/_ctypes/libffi_osx/include, whose name differs
+# from Include only in case: on macOS's case-insensitive filesystem it matched
+# too, and strip_include_prefix then failed analysis with "header
+# 'Python-3.9.0/Modules/_ctypes/libffi_osx/Include/ffi.h' is not under the
+# specified strip prefix". Anchoring selects the same header set a
+# case-sensitive filesystem yields, so the compiled wheels are unchanged.
+# Both placeholders are indexed because .format(version) passes one argument.
 limited_api_build_file = """
 cc_library(
     name = "python_headers",
-    hdrs = glob(["**/Include/**/*.h"]),
-    strip_include_prefix = "Python-{}/Include",
+    hdrs = glob(["Python-{0}/Include/**/*.h"]),
+    strip_include_prefix = "Python-{0}/Include",
     visibility = ["//visibility:public"],
 )
 """
